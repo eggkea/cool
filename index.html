@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Global Chatroom</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <style>
+        body { margin: 0; padding: 0; overflow: hidden; }
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #2e3338; }
+        ::-webkit-scrollbar-thumb { background: #1e1f22; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #4e5058; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel" data-type="module">
+        const { useState, useEffect, useRef } = React;
+        
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.1.0/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.1.0/firebase-auth.js";
+        import { getFirestore, collection, onSnapshot, addDoc, serverTimestamp, doc, setDoc, getDoc, query } from "https://www.gstatic.com/firebasejs/11.1.0/firebase-firestore.js";
+
+        // Firebase Configuration
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'global-chat-app';
+
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+
+        const AVATAR_OPTIONS = [
+            { id: 'cat', emoji: '🐱', label: 'Cat' },
+            { id: 'dog', emoji: '🐶', label: 'Dog' },
+            { id: 'fox', emoji: '🦊', label: 'Fox' },
+            { id: 'panda', emoji: '🐼', label: 'Panda' },
+            { id: 'koala', emoji: '🐨', label: 'Koala' },
+            { id: 'rabbit', emoji: '🐰', label: 'Rabbit' },
+            { id: 'unicorn', emoji: '🦄', label: 'Unicorn' },
+            { id: 'dragon', emoji: '🐲', label: 'Dragon' },
+        ];
+
+        const getAvatarColor = (uid) => {
+            if (!uid) return 'bg-gray-500';
+            const colors = ['bg-indigo-500', 'bg-emerald-500', 'bg-rose-500', 'bg-amber-500', 'bg-sky-500', 'bg-violet-500'];
+            let hash = 0;
+            for (let i = 0; i < uid.length; i++) hash = uid.charCodeAt(i) + ((hash << 5) - hash);
+            return colors[Math.abs(hash) % colors.length];
+        };
+
+        function App() {
+            const [user, setUser] = useState(null);
+            const [profile, setProfile] = useState(null);
+            const [usernameInput, setUsernameInput] = useState("");
+            const [selectedAvatar, setSelectedAvatar] = useState(AVATAR_OPTIONS[0]);
+            const [messages, setMessages] = useState([]);
+            const [newMessage, setNewMessage] = useState("");
+            const [isLoading, setIsLoading] = useState(true);
+            const [view, setView] = useState({ type: 'global', target: null });
+            const [allUsers, setAllUsers] = useState([]);
+            const [isEditingProfile, setIsEditingProfile] = useState(false);
+            const scrollRef = useRef(null);
+
+            // 1. Authenticate FIRST
+            useEffect(() => {
+                const initAuth = async () => {
+                    try {
+                        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                            await signInWithCustomToken(auth, __initial_auth_token);
+                        } else {
+                            await signInAnonymously(auth);
+                        }
+                    } catch (err) {
+                        console.error("Auth error:", err);
+                    }
+                };
+                initAuth();
+                const unsubscribe = onAuthStateChanged(auth, (u) => {
+                    setUser(u);
+                    setIsLoading(false);
+                });
+                return () => unsubscribe();
+            }, []);
+
+            // 2. Fetch User Profile & Global Directory
+            useEffect(() => {
+                if (!user) return;
+
+                const profileRef = doc(db, 'artifacts', appId, 'users', user.uid, 'profile', 'info');
+                getDoc(profileRef).then(snap => {
+                    if (snap.exists()) {
+                        const data = snap.data();
+                        setProfile(data);
+                        setUsernameInput(data.username || "");
+                        if (data.avatar) {
+                            const found = AVATAR_OPTIONS.find(a => a.id === data.avatar.id);
+                            if (found) setSelectedAvatar(found);
+                        }
+                    }
+                }).catch(err => console.error("Profile fetch error:", err));
+
+                const usersRef = collection(db, 'artifacts', appId, 'public', 'data', 'users');
+                const unsub = onSnapshot(usersRef, (snap) => {
+                    setAllUsers(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+                }, (err) => console.error("Users list error:", err));
+
+                return () => unsub();
+            }, [user]);
+
+            // 3. Listen for Messages
+            useEffect(() => {
+                if (!user || !profile) return;
+                
+                let msgCollection;
+                if (view.type === 'global') {
+                    msgCollection = collection(db, 'artifacts', appId, 'public', 'data', 'messages');
+                } else if (view.type === 'dm' && view.target) {
+                    const dmId = [user.uid, view.target.id].sort().join('_');
+                    msgCollection = collection(db, 'artifacts', appId, 'public', 'data', `dm_${dmId}`);
+                } else return;
+
+                const unsub = onSnapshot(msgCollection, (snap) => {
+                    const msgs = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+                        .sort((a, b) => (a.timestamp?.seconds || 0) - (b.timestamp?.seconds || 0));
+                    setMessages(msgs);
+                    setTimeout(() => scrollRef.current?.scrollIntoView({ behavior: 'smooth' }), 100);
+                }, (err) => {
+                    console.error("Messages list error:", err);
+                });
+                return () => unsub();
+            }, [user, profile, view]);
+
+            const handleUpdateProfile = async (e) => {
+                e.preventDefault();
+                if (!usernameInput.trim() || !user) return;
+                const newProfile = { 
+                    username: usernameInput.trim(), 
+                    uid: user.uid, 
+                    avatar: selectedAvatar 
+                };
+                
+                try {
+                    await setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'profile', 'info'), newProfile);
+                    await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'users', user.uid), newProfile);
+                    setProfile(newProfile);
+                    setIsEditingProfile(false);
+                } catch (err) {
+                    console.error("Update profile error:", err);
+                }
+            };
+
+            const sendMessage = async (e) => {
+                e.preventDefault();
+                if (!newMessage.trim() || !user || !profile) return;
+                const text = newMessage;
+                setNewMessage("");
+
+                let msgCollection;
+                if (view.type === 'global') {
+                    msgCollection = collection(db, 'artifacts', appId, 'public', 'data', 'messages');
+                } else {
+                    const dmId = [user.uid, view.target.id].sort().join('_');
+                    msgCollection = collection(db, 'artifacts', appId, 'public', 'data', `dm_${dmId}`);
+                }
+
+                try {
+                    await addDoc(msgCollection, { 
+                        text, 
+                        uid: user.uid, 
+                        username: profile.username, 
+                        avatar: profile.avatar || AVATAR_OPTIONS[0], 
+                        timestamp: serverTimestamp() 
+                    });
+                } catch (err) {
+                    console.error("Send message error:", err);
+                }
+            };
+
+            const AvatarIcon = ({ avatar, size = "w-10 h-10", fontSize = "text-xl", uid }) => (
+                <div className={`${size} rounded-full flex-shrink-0 flex items-center justify-center ${fontSize} ${getAvatarColor(uid)} shadow-inner`}>
+                    {avatar?.emoji || '?'}
+                </div>
+            );
+
+            // GUARD: Wait for authentication and initial loading
+            if (isLoading || !user) {
+                return <div className="h-screen bg-[#313338] flex items-center justify-center text-white font-sans">Connecting...</div>;
+            }
+
+            // Profile setup screen
+            if (!profile || isEditingProfile) {
+                return (
+                    <div className="h-screen bg-[#313338] flex items-center justify-center p-4 font-sans">
+                        <div className="bg-[#2b2d31] p-8 rounded-lg shadow-xl w-full max-w-md">
+                            <h2 className="text-2xl font-bold text-white mb-6 text-center">{profile ? 'Update Your Profile' : 'Customize Your Profile'}</h2>
+                            <div className="flex justify-center mb-6">
+                                <AvatarIcon avatar={selectedAvatar} size="w-20 h-20" fontSize="text-4xl" uid={user.uid} />
+                            </div>
+                            <form onSubmit={handleUpdateProfile} className="space-y-6">
+                                <div>
+                                    <label className="block text-xs font-bold text-[#b5bac1] uppercase mb-2">Display Name</label>
+                                    <input type="text" value={usernameInput} onChange={e => setUsernameInput(e.target.value)} className="w-full p-3 bg-[#1e1f22] rounded text-white outline-none focus:ring-2 focus:ring-indigo-500" maxLength={20} required />
+                                </div>
+                                <div>
+                                    <label className="block text-xs font-bold text-[#b5bac1] uppercase mb-2">Select Avatar</label>
+                                    <div className="grid grid-cols-4 gap-3">
+                                        {AVATAR_OPTIONS.map(opt => (
+                                            <button key={opt.id} type="button" onClick={() => setSelectedAvatar(opt)} className={`p-2 rounded-lg text-2xl transition-all ${selectedAvatar.id === opt.id ? 'bg-indigo-500 scale-110' : 'bg-[#1e1f22] hover:bg-[#35373c]'}`}>{opt.emoji}</button>
+                                        ))}
+                                    </div>
+                                </div>
+                                <div className="flex gap-3">
+                                    {isEditingProfile && <button type="button" onClick={() => setIsEditingProfile(false)} className="flex-1 bg-[#4e5058] text-white font-bold py-3 rounded">Cancel</button>}
+                                    <button type="submit" className="flex-2 bg-indigo-500 text-white font-bold py-3 px-6 rounded w-full">{profile ? 'Save Changes' : 'Start Chatting'}</button>
+                                </div>
+                            </form>
+                        </div>
+                    </div>
+                );
+            }
+
+            return (
+                <div className="flex h-screen bg-[#313338] text-[#dbdee1] font-sans overflow-hidden">
+                    <div className="hidden md:flex w-16 flex-col items-center py-3 bg-[#1e1f22] space-y-3">
+                        <div onClick={() => setView({ type: 'global', target: null })} className={`w-12 h-12 flex items-center justify-center cursor-pointer transition-all ${view.type === 'global' ? 'rounded-xl bg-indigo-500 text-white' : 'rounded-3xl bg-[#313338] text-indigo-500 hover:rounded-xl hover:bg-indigo-500 hover:text-white'}`}><b>G</b></div>
+                    </div>
+                    <div className="w-60 bg-[#2b2d31] flex flex-col">
+                        <div className="h-12 border-b border-[#1e1f22] flex items-center px-4 font-bold text-white shadow-sm">Global Hub</div>
+                        <div className="flex-1 overflow-y-auto p-2">
+                            <h3 className="text-xs font-bold text-[#949ba4] uppercase px-2 mb-2">Channels</h3>
+                            <div onClick={() => setView({ type: 'global', target: null })} className={`flex items-center px-2 py-1.5 rounded cursor-pointer ${view.type === 'global' ? 'bg-[#3f4147] text-white' : 'hover:bg-[#35373c]'}`}><span className="text-[#80848e] mr-2">#</span> global-lounge</div>
+                            <h3 className="text-xs font-bold text-[#949ba4] uppercase px-2 mb-2 mt-4">Direct Messages</h3>
+                            {allUsers.filter(u => u.id !== user.uid).map(u => (
+                                <div key={u.id} onClick={() => setView({ type: 'dm', target: u })} className={`flex items-center px-2 py-1.5 rounded cursor-pointer ${view.type === 'dm' && view.target?.id === u.id ? 'bg-[#3f4147] text-white' : 'hover:bg-[#35373c]'}`}>
+                                    <AvatarIcon avatar={u.avatar} size="w-8 h-8" fontSize="text-sm" uid={u.id} />
+                                    <span className="ml-3 truncate">{u.username}</span>
+                                </div>
+                            ))}
+                        </div>
+                        <div className="bg-[#232428] p-2 flex items-center group">
+                            <AvatarIcon avatar={profile?.avatar} size="w-8 h-8" fontSize="text-sm" uid={user.uid} />
+                            <div className="flex-1 ml-2 truncate text-sm font-bold text-white">{profile?.username}</div>
+                            <button onClick={() => setIsEditingProfile(true)} className="p-1 hover:bg-[#35373c] rounded text-[#b5bac1]">⚙️</button>
+                        </div>
+                    </div>
+                    <div className="flex-1 flex flex-col min-w-0">
+                        <header className="h-12 flex items-center px-4 bg-[#313338] border-b border-[#26272d] shadow-sm"><span className="text-[#80848e] text-2xl mr-2">{view.type === 'global' ? '#' : '@'}</span><h1 className="font-bold text-white">{view.type === 'global' ? 'global-lounge' : view.target?.username}</h1></header>
+                        <main className="flex-1 overflow-y-auto px-4 py-4 space-y-1">
+                            {messages.map((msg, idx) => {
+                                const isSameUser = idx > 0 && messages[idx-1].uid === msg.uid;
+                                return (
+                                    <div key={msg.id} className={`flex px-2 py-0.5 group hover:bg-[#2e3035] -mx-2 ${isSameUser ? '' : 'mt-4'}`}>
+                                        {!isSameUser ? <AvatarIcon avatar={msg.avatar} uid={msg.uid} /> : <div className="w-10" />}
+                                        <div className="ml-4 flex flex-col min-w-0">
+                                            {!isSameUser && <div className="flex items-baseline space-x-2"><span className="font-bold text-white">{msg.username}</span><span className="text-[10px] text-[#949ba4]">{msg.timestamp ? new Date(msg.timestamp.seconds * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) : ''}</span></div>}
+                                            <p className="text-[#dbdee1] break-words">{msg.text}</p>
+                                        </div>
+                                    </div>
+                                );
+                            })}
+                            <div ref={scrollRef} />
+                        </main>
+                        <footer className="p-4">
+                            <form onSubmit={sendMessage} className="bg-[#383a40] rounded-lg px-4 py-2"><input type="text" value={newMessage} onChange={e => setNewMessage(e.target.value)} placeholder="Type a message..." className="w-full bg-transparent border-none outline-none text-[#dbdee1]" /></form>
+                        </footer>
+                    </div>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
